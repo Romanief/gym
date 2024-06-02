@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-env = gym.Env("CartPole-v1")
+env = gym.make("CartPole-v1")
 
 # Set up MatPlotLib
 is_python = "inline" in matplotlib.get_backend()
@@ -48,7 +48,7 @@ class ReplayMemory(object):
     return len(self.memory)
 
 
-class DQN(nn.modules):
+class DQN(nn.Module):
   """
   feed forward neural network that takes in the difference between the current and previous screen patches. It has two outputs, 
   representing Q(s, left) and Q(s, right)  (where s is the input to the network). 
@@ -103,6 +103,11 @@ memory = ReplayMemory(1000)
 steps_done = 0
 
 def select_action(state):
+  """
+  Gets a state as input and returns either a random action or the best possible action given that state
+  based on a probability of epsilon to explore and 1-epsilon to exploit. 
+  Epsilon is calculated each time using the epsilon decay value previously defined
+  """
   global steps_done #  indicates that steps_done is a global variable
   sample = random.random() 
   eps_treshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1 * steps_done / EPS_DECAY)
@@ -120,6 +125,9 @@ def select_action(state):
 episode_duration = []
 
 def plot_duration(show_result = False):
+  """
+  Use MatPlotLib to generate an image showing the result 
+  """
   plt.figure(1)
   duration_t = torch.tensor([episode_duration], dtype=torch.float)
   if show_result:
@@ -143,3 +151,118 @@ def plot_duration(show_result = False):
         display.clear_output(wait=True)
       else:
         display.display(plt.gcf())
+
+
+def optimize_model():
+  """
+  performs a single step of the optimization. It first samples a batch, concatenates all the tensors into a single one, computes
+  Q(st, at) and V(st + 1, a) = max(Q(st + 1, a)), and combines them into our loss. By definition we set V(s) = 0 if 
+  s is a terminal state. We also use a target network to compute V(st + 1) for added stability. 
+  The target network is updated at every step with a soft update controlled by the hyperparameter TAU, which was previously defined
+  """
+  if len(memory) < BATCH_SIZE:
+    return
+
+  transitions = memory.sample(BATCH_SIZE)
+  # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
+  # detailed explanation). This converts batch-array of Transitions
+  # to Transition of batch-arrays.
+  batch = Transition(*zip(*transitions))
+
+  # Compute a mask of non-final states and concatenate the batch elements
+  # (a final state would've been the one after which simulation ended)
+  non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, 
+    batch.next_state)), device=device, dtype=torch.bool)
+  non_final_next_states = torch.cat([s for s in batch.next_state 
+    if s is not None])
+
+  state_batch = torch.cat(batch.state)
+  action_batch = torch.cat(batch.action)
+  reward_batch = torch.cat(batch.reward)
+
+  # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
+  # columns of actions taken. These are the actions which would've been taken
+  # for each batch state according to policy_net
+  state_action_values = policy_net(state_batch).gather(1, action_batch)
+
+  # Compute V(s_{t+1}) for all next states.
+  # Expected values of actions for non_final_next_states are computed based
+  # on the "older" target_net; selecting their best reward with max(1).values
+  # This is merged based on the mask, such that we'll have either the expected
+  # state value or 0 in case the state was final.
+  next_state_values = torch.zeros(BATCH_SIZE, device=device)
+  with torch.no_grad:
+    next_state_values[non_final_mask] = (next_state_values * GAMMA) + reward_batch
+  # Compute the expected Q-Value
+  expected_state_action_value = (next_state_values * GAMMA) + reward_batch
+
+  # Compute Huber loss function: 
+  criteration = nn.SmoothL1Loss()
+  loss = criteration(state_action_values, expected_state_action_value.unsqueeze(1))
+
+  # Optimize the model
+  optimizer.zero_grad()
+  loss.backward()
+  # In-place gradient clipping
+  torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
+  optimizer.step()
+
+
+  """
+  Below, you can find the main training loop. At the beginning we reset the environment and obtain the initial state Tensor. 
+  Then, we sample an action, execute it, observe the next state and the reward (always 1), and optimize our model once. 
+  When the episode ends (our model fails), we restart the loop.
+
+  Below, num_episodes is set to 600 if a GPU is available, otherwise 50 episodes are scheduled so training does not take too long. 
+  However, 50 episodes is insufficient for to observe good performance on CartPole. You should see the model constantly achieve 
+  500 steps within 600 training episodes. Training RL agents can be a noisy process, so restarting training can produce better 
+  results if convergence is not observed.
+  """
+
+  if torch.cuda.is_available():
+    num_episodes = 600
+  else:
+    num_episodes = 50
+
+  for i_episodes in range(num_episodes):
+    # Initialise env end get state
+    state, info = env.reset()
+    state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+    for t in count():
+      action = select_action(state)
+      observation, reward, terminated, truncated, _ = env.step(action.item())
+      reward = torch.tensor([reward], device=device)
+      done = terminated or truncated
+
+      if terminated: 
+        next_state = None
+      else:
+        next_state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
+
+      # store transition in memory
+      memory.push(state, action, next_state, reward)
+
+      # move to the next state
+      state = next_state
+
+      # perform one step optimization (on policy network)
+      optimize_model()
+
+      # Soft update of the target network
+      # θ′ ← τ θ + (1 −τ )θ′
+      target_next_state_dict = target_net.state_dict()
+      policy_net_state_dict = policy_net.state_dict()
+      for key in policy_net_state_dict:
+        target_next_state_dict[key] = policy_net_state_dict[key]*TAU + target_next_state_dict[key]*(1-TAU)
+      target_net.load_state_dict(target_next_state_dict)
+
+      if done:
+        episode_duration.append(t + 1)
+        plot_duration()
+        break
+
+
+print("Complete")
+plot_duration(show_result=True)
+plt.ioff()
+plt.show()
